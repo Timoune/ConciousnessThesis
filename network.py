@@ -1,21 +1,21 @@
 import numpy as np
 
-MODULES = ("S", "A", "R")
 K = 4
 NPC = 15
-NMOD = len(MODULES)
-NG = NMOD * K
-N = NMOD * K * NPC
+NR = 64
+N_S = K * NPC
+N_A = NR
+N_R = K * NPC
+N = N_S + N_A + N_R
 
-MOD_OF = np.repeat(np.arange(NMOD), K * NPC)
-CLU_OF = np.tile(np.repeat(np.arange(K), NPC), NMOD)
-GID = MOD_OF * K + CLU_OF
+SL = slice(0, N_S)
+AL = slice(N_S, N_S + N_A)
+RL = slice(N_S + N_A, N)
 
-CROSS = np.array([
-    [0.00, 1.00, 0.15],
-    [0.45, 0.00, 1.00],
-    [0.10, 0.50, 0.00],
-])
+CLU_S = np.repeat(np.arange(K), NPC)
+CLU_R = np.repeat(np.arange(K), NPC)
+RING_PHI = 2 * np.pi * np.arange(NR) / NR
+CLU_PHI = 2 * np.pi * np.arange(K) / K
 
 DEFAULTS = dict(
     tau_r=0.020,
@@ -24,136 +24,127 @@ DEFAULTS = dict(
     g_I=6.5,
     w_plus=3.2,
     w_minus=-1.0,
-    w_cross=0.8,
     I_bg=0.30,
     sigma=0.06,
+    ring_J0=-3.4,
+    ring_J1=5.2,
+    ring_bg=0.34,
+    ring_beta=2.2,
+    w_SA=0.9,
+    w_AR=0.9,
+    w_RA=0.35,
+    w_AS=0.25,
+    g_rand=1.8,
 )
 
-PRESETS = {
-    "itinerant": dict(DEFAULTS),
-    "frozen": dict(DEFAULTS, beta=0.0),
-    "runaway": dict(DEFAULTS, g_I=0.5),
-    "silent": dict(DEFAULTS, I_bg=-0.2),
-    "hyper": dict(DEFAULTS, tau_a=0.05),
-}
+
+def _tuning(phi_post, phi_pre, width=0.9):
+    d = np.abs(np.angle(np.exp(1j * (phi_post[:, None] - phi_pre[None, :]))))
+    return np.exp(-(d ** 2) / (2 * width ** 2))
 
 
-def build_W(w_plus, w_minus, w_cross, seed=0, jitter=0.1):
+def build_W(p, seed=0, jitter=0.08):
     rng = np.random.default_rng(seed)
-    same_mod = MOD_OF[:, None] == MOD_OF[None, :]
-    same_clu = GID[:, None] == GID[None, :]
-    aligned = CLU_OF[:, None] == CLU_OF[None, :]
-    cm = CROSS[MOD_OF[:, None], MOD_OF[None, :]]
     W = np.zeros((N, N))
-    W += same_clu * (w_plus / NPC)
-    W += (same_mod & ~same_clu) * (w_minus / (NPC * (K - 1)))
-    W += (~same_mod) * aligned * cm * (w_cross / NPC)
+
+    for lo, clu in ((SL, CLU_S), (RL, CLU_R)):
+        same = clu[:, None] == clu[None, :]
+        blk = same * (p["w_plus"] / NPC) + (~same) * (p["w_minus"] / (NPC * (K - 1)))
+        W[lo, lo] = blk
+
+    dphi = RING_PHI[:, None] - RING_PHI[None, :]
+    W[AL, AL] = (p["ring_J0"] + p["ring_J1"] * np.cos(dphi)) / NR
+
+    W[AL, SL] = _tuning(RING_PHI, CLU_PHI[CLU_S]) * (p["w_SA"] / N_S)
+    W[RL, AL] = _tuning(CLU_PHI[CLU_R], RING_PHI) * (p["w_AR"] / NR)
+    W[AL, RL] = _tuning(RING_PHI, CLU_PHI[CLU_R]) * (p["w_RA"] / N_R)
+    W[SL, AL] = _tuning(CLU_PHI[CLU_S], RING_PHI) * (p["w_AS"] / NR)
+
     W *= 1.0 + jitter * rng.standard_normal((N, N))
+    W += p["g_rand"] * rng.standard_normal((N, N)) / np.sqrt(N)
     np.fill_diagonal(W, 0.0)
     return W
 
 
-def phi(h, theta=0.35, k=0.08):
+def phi_act(h, theta=0.35, k=0.08):
     return 1.0 / (1.0 + np.exp(-(h - theta) / k))
 
 
-def simulate(params=None, T=20.0, dt=0.001, seed=1, sample_every=10, record_units=False):
+def _drive(p, r, a, ext, W):
+    mS = r[SL].mean()
+    mR = r[RL].mean()
+    inh = np.empty(N)
+    inh[SL] = p["g_I"] * mS
+    inh[AL] = 0.0
+    inh[RL] = p["g_I"] * mR
+    bg = np.empty(N)
+    bg[SL] = p["I_bg"]
+    bg[AL] = p["ring_bg"]
+    bg[RL] = p["I_bg"]
+    return W @ r - a - inh + bg + ext
+
+
+def bump_angle(rA):
+    z = (rA * np.exp(1j * RING_PHI)).sum()
+    return np.angle(z), np.abs(z) / max(rA.sum(), 1e-9)
+
+
+def simulate(params=None, T=20.0, dt=0.001, seed=1, sample_every=10,
+             input_fn=None, r0=None, a0=None, record_units=False):
     p = dict(DEFAULTS, **(params or {}))
     rng = np.random.default_rng(seed)
-    W = build_W(p["w_plus"], p["w_minus"], p["w_cross"], seed)
-    steps = int(T / dt)
+    W = build_W(p, seed)
+    steps = int(round(T / dt))
     n_samp = steps // sample_every
 
-    r = 0.05 + 0.02 * rng.random(N)
-    a = np.zeros(N)
-    proj = np.zeros((NG, N))
-    for g in range(NG):
-        proj[g] = (GID == g) / NPC
+    r = 0.05 + 0.02 * rng.random(N) if r0 is None else r0.copy()
+    a = np.zeros(N) if a0 is None else a0.copy()
 
-    clusters = np.zeros((n_samp, NG))
+    beta_vec = np.empty(N)
+    beta_vec[SL] = p["beta"]
+    beta_vec[AL] = p["ring_beta"]
+    beta_vec[RL] = p["beta"]
+
+    projS = np.array([(CLU_S == k) / NPC for k in range(K)])
+    projR = np.array([(CLU_R == k) / NPC for k in range(K)])
+
+    cs = np.zeros((n_samp, K))
+    cr = np.zeros((n_samp, K))
+    ring = np.zeros((n_samp, NR))
+    theta = np.zeros(n_samp)
+    coh = np.zeros(n_samp)
     units = np.zeros((n_samp, N)) if record_units else None
+    adapt = np.zeros((n_samp, N)) if record_units else None
+
     noise_amp = p["sigma"] * 0.01 / np.sqrt(dt)
+    ext = np.zeros(N)
 
     for t in range(steps):
-        h = W @ r - a - p["g_I"] * r.mean() + p["I_bg"]
-        h += noise_amp * rng.standard_normal(N)
-        r += dt / p["tau_r"] * (-r + phi(h))
-        np.clip(r, 0.0, 1.0, out=r)
-        a += dt / p["tau_a"] * (-a + p["beta"] * r)
+        if input_fn is not None:
+            ext = input_fn(t * dt)
+        xi = noise_amp * rng.standard_normal(N)
+        h1 = _drive(p, r, a, ext + xi, W)
+        f1 = (-r + phi_act(h1)) / p["tau_r"]
+        g1 = (-a + beta_vec * r) / p["tau_a"]
+        rp = np.clip(r + dt * f1, 0.0, 1.0)
+        ap = a + dt * g1
+        h2 = _drive(p, rp, ap, ext + xi, W)
+        f2 = (-rp + phi_act(h2)) / p["tau_r"]
+        g2 = (-ap + beta_vec * rp) / p["tau_a"]
+        r = np.clip(r + 0.5 * dt * (f1 + f2), 0.0, 1.0)
+        a = a + 0.5 * dt * (g1 + g2)
+
         if t % sample_every == 0:
             i = t // sample_every
             if i < n_samp:
-                clusters[i] = proj @ r
+                cs[i] = projS @ r[SL]
+                cr[i] = projR @ r[RL]
+                ring[i] = r[AL]
+                theta[i], coh[i] = bump_angle(r[AL])
                 if record_units:
                     units[i] = r
+                    adapt[i] = a
 
-    return dict(clusters=clusters, units=units, params=p, dt_sample=dt * sample_every)
-
-
-def winners(clusters, threshold=0.15):
-    top = clusters.max(axis=1)
-    return np.where(top > threshold, clusters.argmax(axis=1), -1)
-
-
-def lz76(seq):
-    s = "".join(chr(65 + int(x) + 1) for x in seq)
-    n = len(s)
-    if n < 3:
-        return 0
-    i, k, l, c, kmax = 0, 1, 1, 1, 1
-    while True:
-        if s[i + k - 1] == s[l + k - 1]:
-            k += 1
-            if l + k > n:
-                c += 1
-                break
-        else:
-            kmax = max(kmax, k)
-            i += 1
-            if i == l:
-                c += 1
-                l += kmax
-                if l + 1 > n:
-                    break
-                i, k, kmax = 0, 1, 1
-            else:
-                k = 1
-    return c
-
-
-def diagnostics(result, burn_frac=0.1):
-    cl = result["clusters"]
-    burn = int(len(cl) * burn_frac)
-    cl = cl[burn:]
-    ds = result["dt_sample"]
-    w = winners(cl)
-    changes = w[1:] != w[:-1]
-    n_trans = int(changes.sum())
-    runs, run = [], 1
-    for i in range(1, len(w)):
-        if w[i] == w[i - 1]:
-            run += 1
-        else:
-            runs.append(run)
-            run = 1
-    duration = len(cl) * ds
-    C = np.cov(cl.T)
-    pr = float(np.trace(C) ** 2 / np.sum(C * C)) if np.sum(C * C) > 0 else 0.0
-    compressed = w[np.r_[True, changes]]
-    return dict(
-        transitions_per_s=n_trans / duration,
-        mean_dwell_ms=float(np.mean(runs) * ds * 1000) if runs else duration * 1000,
-        states_visited=len(set(w[w >= 0].tolist())),
-        participation_ratio=pr,
-        mean_rate=float(cl.mean()),
-        frac_active=float((w >= 0).mean()),
-        sequence_lz=lz76(compressed),
-        window_s=duration,
-    )
-
-
-if __name__ == "__main__":
-    for name, p in PRESETS.items():
-        d = diagnostics(simulate(p, T=20.0))
-        line = "  ".join(f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}" for k, v in d.items())
-        print(f"{name:10s} {line}")
+    return dict(S=cs, R=cr, ring=ring, theta=theta, coherence=coh,
+                units=units, adapt=adapt, params=p, dt_sample=dt * sample_every,
+                final=dict(r=r, a=a))
